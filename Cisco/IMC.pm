@@ -114,16 +114,22 @@ use HTTP::Request::Common;	# for POST constant
 
 use Net::Ping;
 
+use Sort::Versions;
+
 use Exporter 'import';
 our @EXPORT_OK = qw(
 	&check_bool 
 	&ascii_password_to_hex_encryption_key
 	$DEFAULT_ADMIN 
 	$DEFAULT_PASS
+	$ALT_DEFAULT_PASS
 );
 
 our $DEFAULT_ADMIN	= 'admin';
 our $DEFAULT_PASS	= 'password';
+our $ALT_DEFAULT_PASS	= 'Cisco1234';
+
+use constant TIMEOUT => 120;
 
 # A set of supported top level XML request/response tags we're going to try and support.
 my %SUPPORTED_XML = (
@@ -170,8 +176,11 @@ sub new ($$) {
 	my ($opts) = @_;
 
 	# Sanity check some required options.
+	if (!$opts->{addr}) {
+		croak('Missing or invalid addr option.');
+	}
 	if (!$opts->{host}) {
-		croak('Missing or invalid host option.');
+		$opts->{host} = $opts->{addr};	
 	}
 	if (!$opts->{user}) {
 		croak('Missing or invalid user option.');
@@ -182,12 +191,17 @@ sub new ($$) {
 	if ($opts->{debug} && $opts->{debug} !~ /^[0-9]$/) {
 		croak('Missing or invalid debug option.');
 	}
+	if ($opts->{readonly} && $opts->{readonly} !~ /^(0|1|yes|no|true|false)$/) {
+		croak('Missing or invalid debug option.');
+	}
 
 	my $self = {
+		addr			=> $opts->{addr},
 		host			=> $opts->{host},
 		user			=> $opts->{user},
 		password		=> $opts->{password},
 		debug			=> $opts->{debug},
+		readonly		=> $opts->{readonly},
 		# A reference to our LWP::UserAgent object:
 		lwp_ua			=> undef,
 		# A reference to our XML::Simple object:
@@ -195,8 +209,25 @@ sub new ($$) {
 		# Our current authentication cookie info:
 		auth_cookie		=> undef,
 		auth_cookie_valid_until	=> 0,
+		
+		# A cached value of the firmware version of the CIMC.
+		firmware_version	=> undef,
+
+		# A cached copy of the pidCatalog response for use in
+		# determining what kind of hardware the machine has installed.
+		pidCatalog		=> undef,	
+
+		# A cached copy of the top level computeRackUnit response for
+		# use in determining what kind of hardware the machine has
+		# installed.
+		computeRackUnit		=> undef,	
 	};
 	$self->{debug} = 0 unless ($self->{debug});
+	$self->{readonly} = 0 unless ($self->{readonly});
+	$self->{readonly} = check_bool($self->{readonly});
+
+	$self->{host_addr} = Cisco::IMC::get_host_addr_string($self->{host}, $self->{addr});
+
 	bless($self, $class);
 
 	return $self;
@@ -282,7 +313,7 @@ sub ping($) {
 	my $p = Net::Ping->new('tcp');
 	# Try connecting to the www port instead of the echo port.
 	$p->port_number(scalar(getservbyname('https', 'tcp')));
-	$ret = $p->ping($self->{host});
+	$ret = $p->ping($self->{addr});
 	$p->close();
 	return $ret;
 }
@@ -351,7 +382,7 @@ retrieve all child object data as well.
 
 =cut
 
-sub configResolveDn($$;$) { 
+sub configResolveDn($$;$) {
 	my $self = shift;
 	return $self->_configResolve('configResolveDn', @_);
 }
@@ -528,6 +559,11 @@ sub configConfMo($$$) {
 		$request->{configConfMo}->[0]->{inHierarchical} = (check_bool($inHierarchical)) ? 'true' : 'false';
 	}
 
+	if (check_bool($self->{readonly})) {
+		carp("WARNING: Refusing to issue request in readonly mode.  You may get unexpected results: ".Dumper($request).' ');
+		return $inConfig;
+	}
+
 	my $response = $self->_issue_request($request);
 	my $outConfig = $response->{configConfMo}->[0]->{outConfig}->[0];
 	return $outConfig;
@@ -551,6 +587,232 @@ sub setConfig($$$) {
 
 =pod
 
+=head2 get_rack_unit_info()
+
+	warn Dumper($cimc->get_rack_unit_info()), ' ';
+
+Gets (and caches) the computeRackUnit info.
+
+=cut
+
+sub get_rack_unit_info($;$) {
+	my $self = shift;
+	my ($force) = @_;
+
+	if ($force || !defined($self->{computeRackUnit}) || !scalar(keys(%{$self->{computeRackUnit}}))) {
+		carp("Getting rack-unit info on $self->{host_addr}.") if ($self->{debug});
+		my $dn = 'sys/rack-unit-1';
+		# NOTE: We're just getting the top level here.
+		my $response = $self->getConfigDn($dn) or die($@);
+		$self->{computeRackUnit} = $response;
+	}
+
+	return $self->{computeRackUnit};
+}
+
+
+=pod
+
+=head2 get_product_inventory()
+
+	warn Dumper($cimc->get_product_inventory()), ' ';
+
+Gets (and caches) the pidCatalog info.
+
+=cut
+
+sub get_product_inventory($;$) {
+	my $self = shift;
+	my ($force) = @_;
+
+	if ($force || !defined($self->{pidCatalog}) || !scalar(keys(%{$self->{pidCatalog}}))) {
+		carp("Getting machine product inventory on $self->{host_addr}.") if ($self->{debug});
+		my $dn = 'sys/rack-unit-1/board/pid';
+		my $response = $self->getConfigDn($dn, 1) or die($@);
+		$self->{pidCatalog} = $response;
+	}
+
+	return $self->{pidCatalog};
+}
+
+=pod
+
+=head2 load_product_inventory()
+
+	# Powers the machine on and waits until the pidCatalog is available.
+	$cimc->load_product_inventory();
+
+A type agnostic version of C<CloudLab::Cisco::IMCs::load_machine_inventory()>.
+
+=cut
+
+sub load_product_inventory($) {
+	my $self = shift;
+
+	$self->set_power_mode('up');
+
+	$self->wait_response(180, sub {
+		carp("Waiting for pidCatalog to load ...") if ($self->{debug});
+		my $response = $self->get_product_inventory(1);
+		if (scalar(grep { $_ =~ /^pidCatalog/ } keys($response->{pidCatalog}->[0]))) {
+			return 1;
+		}
+		else {
+			return 0;
+		}
+	});
+
+	return $self->{pidCatalog};
+}
+
+=pod
+
+=head2 has_vNic_adaptor()
+
+	$cimc->reset_vNic_adaptors() if ($cimc->has_vNic_adaptor());
+
+Checks to see if the machine looks to have a VIC Network Adaptor that we known
+how to manage.
+Else, it might have one of the Intel 10G NICs (eg: X520).
+
+=cut
+
+sub has_vNic_adaptor($) {
+	my $self = shift;
+	my $response = $self->get_product_inventory();
+	return grep { 
+		$_->{device} eq '0x0042'		# VIC Management Controller, pid: UCSC-MLOM-CSC-02
+		&& $_->{vendor} eq '0x1137' 		# Cisco
+		&& $_->{pid} eq 'UCSC-MLOM-CSC-02'
+		} @{$response->{pidCatalog}->[0]->{pidCatalogPCIAdapter}};
+}
+
+=pod
+
+=head2 has_x520_nic()
+
+Checks to see if the machine looks to have an Intel X520 NIC.
+
+=cut
+
+sub has_x520_nic() {
+	my $self = shift;
+	my $response = $self->get_product_inventory();
+	return grep { 
+		$_->{device} eq '0x10fb'	# 82599ES 10-Gigabit SFI/SFP+ Network Connection
+		&& $_->{vendor} eq '0x8086' 	# Intel
+		&& $_->{pid} eq 'N2XX-AIPCI01'
+		} @{$response->{pidCatalog}->[0]->{pidCatalogPCIAdapter}};
+}
+
+=pod
+
+=head2 has_raid_hba()
+	
+	$cimc->reset_raid_hba_adaptors if ($cimc->has_raid_hba());
+
+Checks to see if the machine looks to have a RAID HBA that we know how to manage.
+Else, it might be a passthru controller that has no special smarts built in to it.
+
+=cut
+
+sub has_raid_hba($) {
+	my $self = shift;
+	my $response = $self->get_product_inventory();
+	return grep { 
+		$_->{device} eq '0x005d'	# MegaRAID SAS-3 3108 [Invader]
+		&& $_->{vendor} eq '0x1000' 	# LSI
+		&& $_->{pid} eq 'UCSC-MRAID12G'
+		} @{$response->{pidCatalog}->[0]->{pidCatalogPCIAdapter}};
+}
+
+=pod
+
+=head2 has_passthru_hba()
+
+Checks to see if the machine looks to have a passthru HBA controller.
+
+=cut
+
+sub has_passthru_hba() {
+	my $self = shift;
+	my $response = $self->get_product_inventory();
+	return grep { 
+		$_->{device} eq '0x0090'	# SAS3108 PCI-Express Fusion-MPT SAS-3
+		&& $_->{vendor} eq '0x1000' 	# LSI
+		&& $_->{pid} eq 'UCSC-SAS12GHBA'
+		} @{$response->{pidCatalog}->[0]->{pidCatalogPCIAdapter}};
+}
+
+=pod
+
+=head2 get_model()
+
+=cut
+
+sub get_model($) {
+	my $self = shift;
+
+	carp("Getting model info for $self->{host_addr}.") if ($self->{debug});
+
+	my $response = $self->get_rack_unit_info();
+	return $response->{computeRackUnit}->[0]->{model};
+}
+
+=pod
+
+=head2 get_memory_info()
+
+	my ($totalMemory, $memorySpeed) = $cimc->get_memory_info();
+
+Returns various basic info about the memory installed on the machine.
+
+=cut
+
+sub get_memory_info($) {
+	my $self = shift;
+
+	carp("Getting memory info for $self->{host_addr}.") if ($self->{debug});
+
+	my $response = $self->get_rack_unit_info();
+	return (
+		$response->{computeRackUnit}->[0]->{totalMemory},
+		$response->{computeRackUnit}->[0]->{memorySpeed}
+	);
+}
+
+=pod
+
+=head2 get_cpu_info()
+
+	my ($totalCPUs, $totaCores, $totalThreads, $cpuSpeed, $cpuModel) = $cimc->get_cpu_info();
+
+Returns various basic info about the CPU(s) installed on the machine.
+
+=cut
+
+sub get_cpu_info($) {
+	my $self = shift;
+
+	carp("Getting CPU info for $self->{host_addr}.") if ($self->{debug});
+
+	my $ru_resp = $self->get_rack_unit_info();
+	my $pid_resp = $self->get_product_inventory();
+
+	# TODO: This currently assumes that all sockets have the same speed/model.
+	# We should check/verify that and alert if its not the case.
+
+	return (
+		$ru_resp->{computeRackUnit}->[0]->{numOfCpus},
+		$ru_resp->{computeRackUnit}->[0]->{numOfCores},
+		$ru_resp->{computeRackUnit}->[0]->{numOfThreads},
+		$pid_resp->{pidCatalog}->[0]->{pidCatalogCpu}->[0]->{currentspeed},
+		$pid_resp->{pidCatalog}->[0]->{pidCatalogCpu}->[0]->{model}
+	);
+}
+
+=pod
+
 =head2 get_vNic_adaptors()
 
 	warn Dumper($cimc->get_vNic_adaptors()), ' ';
@@ -561,6 +823,8 @@ Gets the vNic adaptors for the CIMC.
 
 sub get_vNic_adaptors($) {
 	my $self = shift;
+
+	carp("Getting vNic adaptors on $self->{host_addr}.") if ($self->{debug});
 
 	my $class = 'adaptorUnit';
 
@@ -583,7 +847,41 @@ sub reset_vNic_adaptor($$) {
 	my $self = shift;
 	my ($vna_dn) = @_;
 
-	carp("Resetting vNic $vna_dn on $self->{host}.") if ($self->{debug});
+	carp("Resetting vNic $vna_dn on $self->{host_addr}.") if ($self->{debug});
+
+	# NOTE: This was copied/edited from the set_raid_hba_adaptor_jbod_mode() sub.
+	carp("Making sure that $self->{host_addr} is powered on so we can communicate with the VIC.") if ($self->{debug});
+	if ($self->set_power_mode('up')) {
+		$self->wait_response(180, sub {
+			carp("Waiting for VIC option ROM to POST ...") if ($self->{debug});
+
+			# Assuming that's the case as soon as the network
+			# controller can report on the power status of a drive.
+			# HACK: But that's not actually true since it caches
+			# that data, so just wait instead.
+			# This only happens if we actually had to power on the
+			# machine anyways.
+
+			$self->{cimc}->getConfigDn('sys');
+			# We're just waiting now, so we don't care what the
+			# response was, just want to keep the connection alive.
+			return 0;
+
+=hack_disabled
+			my $dn = $vna_dn;
+			my $response = $self->getConfigDn($dn);
+			if (
+				$response
+				&& $response->{serial}
+			) {
+				return 1;
+			}
+			else {
+				return 0;
+			}
+=cut
+		}) unless ($self->{readonly});
+	}
 
 	my $inConfig = {
 		adaptorUnit	=> [
@@ -612,7 +910,7 @@ Resets the vNic adaptors on the CIMC.
 sub reset_vNic_adaptors($) {
 	my $self = shift;
 
-	carp("Resetting vNic adaptors from $self->{host}.") if ($self->{debug});
+	carp("Resetting vNic adaptors from $self->{host_addr}.") if ($self->{debug});
 
 	my $response = $self->get_vNic_adaptors();
 
@@ -641,6 +939,8 @@ sub get_vNic_settings($;$$$) {
 
 	$inHierarchical = 1 unless (defined($inHierarchical));
 	$type = 'all' unless ($type);
+
+	carp("Getting $type vNic settings on $self->{host_addr}.") if ($self->{debug});
 
 	my $class;
 	if ($type eq 'all') {
@@ -672,6 +972,83 @@ sub get_vNic_settings($;$$$) {
 
 =pod
 
+=head2 get_Nic_adaptors()
+
+	warn Dumper($cimc->get_Nic_adaptors()), ' ';
+
+Gets the non-vNic Nic adaptors for the CIMC.
+
+=cut
+
+sub get_Nic_adaptors($) {
+	my $self = shift;
+
+	carp("Getting standard network adapters on $self->{host_addr}.") if ($self->{debug});
+
+	my $class = 'networkAdapterUnit';
+
+	my $response = $self->getConfigClass($class) or die($@);
+	return $response->{$class};
+}
+
+
+=pod
+
+=head2 get_Nic_settings(;$$$)
+
+	warn Dumper($cimc->get_Nic_settings($inHierachical, $networkadapter_dn)), ' ';
+
+Gets the non-vNic Nic settings for the CIMC, optionally restricted to a
+particular parent C<$networkadapter_dn>.
+
+=cut
+
+sub get_Nic_settings($;$$$) {
+	my $self = shift;
+	my ($inHierarchical, $networkadapter_dn) = @_;
+
+	carp("Getting network adapter settings on $self->{host_addr}.") if ($self->{debug});
+
+	$inHierarchical = 1 unless (defined($inHierarchical));
+
+	my $class = 'networkAdapterUnit';
+
+	my $response;
+	if ($networkadapter_dn) {
+		$response = $self->getConfigDn($networkadapter_dn, $inHierarchical) or die($@);
+	}
+	else {
+		$response = $self->getConfigClass($class, $inHierarchical) or die($@);
+	}
+	return $response->{$class};
+}
+
+
+=pod
+
+=head2 get_mgmtIf_settings(;$$$)
+
+	warn Dumper($cimc->get_mgmtIf_settings()), ' ';
+
+Gets the CIMC mgmtIf settings.
+
+=cut
+
+sub get_mgmtIf_settings($;$$$) {
+	my $self = shift;
+
+	carp("Getting CIMC mgmtIf settings on $self->{host_addr}.") if ($self->{debug});
+
+	my $class = 'mgmtIf';
+
+	my $response = $self->getConfigClass($class, 1) or die($@);
+
+	return $response->{$class};
+}
+
+
+=pod
+
 =head2 get_vMedia_maps()
 
 	warn Dumper($cimc->get_vMedia_maps()), ' ';
@@ -682,6 +1059,8 @@ Gets the currently attached vMedia for the CIMC.
 
 sub get_vMedia_maps($) {
 	my $self = shift;
+
+	carp("Getting vMedia maps on $self->{host_addr}.") if ($self->{debug});
 
 	my $class = 'commVMediaMap';
 
@@ -704,7 +1083,7 @@ sub remove_vMedia_map($$) {
 	my $self = shift;
 	my ($vmedia_dn) = @_;
 
-	carp("Removing vMedia map $vmedia_dn from $self->{host}.") if ($self->{debug});
+	carp("Removing vMedia map $vmedia_dn from $self->{host_addr}.") if ($self->{debug});
 
 	my $inConfig = {
 		commVMedia	=> [
@@ -733,7 +1112,7 @@ Removes the vMedia maps from the CIMC.
 sub remove_vMedia_maps($) {
 	my $self = shift;
 
-	carp("Removing vMedia maps from $self->{host}.") if ($self->{debug});
+	carp("Removing vMedia maps from $self->{host_addr}.") if ($self->{debug});
 
 	my $response = $self->get_vMedia_maps();
 
@@ -745,11 +1124,13 @@ sub remove_vMedia_maps($) {
 }
 
 
+# TODO: Rename this to not include passthrough controllers since they don't show up under these classes.
+
 =pod
 
-=head2 get_hba_adaptors(;$)
+=head2 get_raid_hba_adaptors(;$)
 
-	warn Dumper($cimc->get_hba_adaptors()), ' ';
+	warn Dumper($cimc->get_raid_hba_adaptors()), ' ';
 
 Gets the HBA/RAID storage controller adaptors for the CIMC.
 
@@ -757,9 +1138,11 @@ Takes an optional C<$inHierarchical> option.
 
 =cut
 
-sub get_hba_adaptors($;$) {
+sub get_raid_hba_adaptors($;$) {
 	my $self = shift;
 	my ($inHierarchical) = @_;
+
+	carp("Getting RAID HBA adaptors on $self->{host_addr}.") if ($self->{debug});
 
 	my $class = 'storageController';
 
@@ -770,36 +1153,21 @@ sub get_hba_adaptors($;$) {
 
 =pod 
 
-=head2 reset_hba_adaptor($)
+=head2 reset_raid_hba_adaptor($)
 
-	$cimc->reset_hba_adaptor($hba_dn) or die($@);
+	$cimc->reset_raid_hba_adaptor($hba_dn) or die($@);
 
 Resets the HBA adaptor given at C<$hba_dn> for the CIMC.
 
 =cut
 
-sub reset_hba_adaptor($$) {
+sub reset_raid_hba_adaptor($$) {
 	my $self = shift;
 	my ($hba_dn) = @_;
 
-	carp("Resetting RAID/HBA adaptor at $hba_dn for $self->{host}.") if ($self->{debug});
+	my $inConfig;
 
-	# FIXED: (see remove_virtual_drives below) 
-	# This doesn't appear to actually delete all of the virtual devices.
-	# We may have to enumerate them and delete them one at a time instead.
-	my $inConfig = {
-		storageController	=> [
-			{
-				adminAction	=> 'delete-all-vds-reset-pds',
-				dn		=> $hba_dn,
-			},
-		],
-	};
-	$self->setConfig($inConfig, $hba_dn) or die($@);
-
-	# DONE: Hmm, which one of these?  Or both?  Nah, just the first one.
-
-	return 1;
+	carp("Clearing foreign config from RAID HBA adaptor at $hba_dn for $self->{host_addr}.") if ($self->{debug});
 
 	$inConfig = {
 		storageController	=> [
@@ -811,29 +1179,49 @@ sub reset_hba_adaptor($$) {
 	};
 	$self->setConfig($inConfig, $hba_dn) or carp($@);
 
+	carp("Resetting RAID HBA adaptor at $hba_dn for $self->{host_addr}.") if ($self->{debug});
+
+	# FIXED: (see remove_virtual_drives below) 
+	# This doesn't appear to actually delete all of the virtual devices.
+	# We may have to enumerate them and delete them one at a time instead.
+	$inConfig = {
+		storageController	=> [
+			{
+				adminAction	=> 'delete-all-vds-reset-pds',
+				dn		=> $hba_dn,
+			},
+		],
+	};
+	$self->setConfig($inConfig, $hba_dn) or die($@);
+
+	# DONE: Hmm, which one of these?  Or both?  Nah, just the first one.
+	# UPDATE: Nevermind, need both, but reverse the order.
+
+	# Might need a server reset too though.
+
 	return 1;
 }
 
 
 =pod
 
-=head2 reset_hba_adaptors();
+=head2 reset_raid_hba_adaptors();
 
-	$cimc->reset_hba_adaptors() or die($@);
+	$cimc->reset_raid_hba_adaptors() or die($@);
 
 Resets all of the HBA adaptors for the CIMC.
 
 =cut
 
-sub reset_hba_adaptors($) {
+sub reset_raid_hba_adaptors($) {
 	my $self = shift;
 
-	carp("Resetting RAID/HBA adaptors for $self->{host}.") if ($self->{debug});
+	carp("Resetting RAID HBA adaptors for $self->{host_addr}.") if ($self->{debug});
 
-	my $response = $self->get_hba_adaptors();
+	my $response = $self->get_raid_hba_adaptors();
 
 	foreach my $ha_resp (@$response) {
-		$self->reset_hba_adaptor($ha_resp->{dn}) or die($@);
+		$self->reset_raid_hba_adaptor($ha_resp->{dn}) or die($@);
 	}
 
 	return 1;
@@ -842,9 +1230,9 @@ sub reset_hba_adaptors($) {
 
 =pod
 
-=head2 set_hba_adaptor_jbod_mode($)
+=head2 set_raid_hba_adaptor_jbod_mode($)
 
-	$cimc->set_hba_adaptor_jbod_mode($hba_dn, $jbod_mode) or die($@);
+	$cimc->set_raid_hba_adaptor_jbod_mode($hba_dn, $jbod_mode) or die($@);
 
 Sets the JBOD mode for the HBA given by C<$hba_dn> on the CIMC.
 
@@ -852,13 +1240,13 @@ NOTE: You probably need to make run something like C<load_inventory()> first.
 
 =cut
 
-sub set_hba_adaptor_jbod_mode($$$) {
+sub set_raid_hba_adaptor_jbod_mode($$$) {
 	my $self = shift;
 	my ($hba_dn, $jbod_mode) = @_;
 
 	$jbod_mode = (check_bool($jbod_mode)) ? 'true' : 'false';
 
-	carp("Checking RAID/HBA $hba_dn JBOD mode for $self->{host}.") if ($self->{debug});
+	carp("Checking RAID HBA $hba_dn JBOD mode for $self->{host_addr}.") if ($self->{debug});
 	
 	# DONE: Make this $model dependent.  Or independent.
 	my $response = $self->getConfigDn("$hba_dn/controller-settings") or die($@);
@@ -867,34 +1255,40 @@ sub set_hba_adaptor_jbod_mode($$$) {
 	}
 	# else, need to make the change
 
-	carp("Setting RAID/HBA $hba_dn JBOD mode to $jbod_mode for $self->{host}.") if ($self->{debug});
+	carp("Setting RAID HBA $hba_dn JBOD mode to $jbod_mode for $self->{host_addr}.") if ($self->{debug});
 
-	carp("Making sure that $self->{host} is powered on so we can communicate with the RAID/HBA.") if ($self->{debug});
+	carp("Making sure that $self->{host_addr} is powered on so we can communicate with the RAID HBA.") if ($self->{debug});
 	if ($self->set_power_mode('up')) {
-		$self->wait_response(60, sub {
+		$self->wait_response(180, sub {
 			carp("Waiting for RAID/HBA option ROM to POST ...") if ($self->{debug});
+
 			# Assuming that's the case as soon as the storage
 			# controller can report on the power status of a drive.
 			# HACK: But that's not actually true since it caches
 			# that data, so just wait instead.
 			# This only happens if we actually had to power on the
 			# machine anyways.
-			sleep(180);
-			return 1;
-#hack_disabled
-#			my $dn = "$hba_dn/pd-1/general-props";
-#			my $response = $self->getConfigDn($dn);
-#			if (
-#				$response 
-#				&& $response->{storageLocalDiskProps}->[0]->{health} 
-#				&& $response->{storageLocalDiskProps}->[0]->{powerState} eq 'active'
-#			) {
-#				return 1;
-#			}
-#			else {
-#				return 0;
-#			}
-		});
+
+			$self->{cimc}->getConfigDn('sys');
+			# We're just waiting now, so we don't care what the
+			# response was, just want to keep the connection alive.
+			return 0;
+
+=hack_disabled
+			my $dn = "$hba_dn/pd-1/general-props";
+			my $response = $self->getConfigDn($dn);
+			if (
+				$response 
+				&& $response->{storageLocalDiskProps}->[0]->{health} 
+				&& $response->{storageLocalDiskProps}->[0]->{powerState} eq 'active'
+			) {
+				return 1;
+			}
+			else {
+				return 0;
+			}
+=cut
+		}) unless ($self->{readonly});
 	}
 
 	my $inConfig = {
@@ -909,7 +1303,7 @@ sub set_hba_adaptor_jbod_mode($$$) {
 
 	sleep(5);
 	$self->wait_response(90, sub {
-		carp("Waiting for RAID/HBA option to reconfigure JBOD mode ...") if ($self->{debug});
+		carp("Waiting for RAID HBA option to reconfigure JBOD mode ...") if ($self->{debug});
 
 		my $dn = "$hba_dn/controller-settings";
 		my $response = $self->getConfigDn($dn);
@@ -927,24 +1321,24 @@ sub set_hba_adaptor_jbod_mode($$$) {
 
 =pod
 
-=head2 set_hba_adaptors_jbod_mode();
+=head2 set_raid_hba_adaptors_jbod_mode();
 
-	$cimc->set_hba_adaptors_jbod_mode() or die($@);
+	$cimc->set_raid_hba_adaptors_jbod_mode() or die($@);
 
 Sets all of the HBA adaptor's JBOD modes on the CIMC.
 
 =cut
 
-sub set_hba_adaptors_jbod_mode($$) {
+sub set_raid_hba_adaptors_jbod_mode($$) {
 	my $self = shift;
 	my ($jbod_mode) = @_;
 
-	carp("Setting RAID/HBA adaptors JBOD mode to $jbod_mode for $self->{host}.") if ($self->{debug});
+	carp("Setting RAID HBA adaptors JBOD mode to $jbod_mode for $self->{host_addr}.") if ($self->{debug});
 
-	my $response = $self->get_hba_adaptors();
+	my $response = $self->get_raid_hba_adaptors();
 
 	foreach my $ha_resp (@$response) {
-		$self->set_hba_adaptor_jbod_mode($ha_resp->{dn}, $jbod_mode) or die($@);
+		$self->set_raid_hba_adaptor_jbod_mode($ha_resp->{dn}, $jbod_mode) or die($@);
 	}
 
 	return 1;
@@ -953,17 +1347,19 @@ sub set_hba_adaptors_jbod_mode($$) {
 
 =pod
 
-=head2 get_hba_virtual_drives()
+=head2 get_raid_hba_virtual_drives()
 
-	warn Dumper($cimc->get_hba_virtual_drives()), ' ';
+	warn Dumper($cimc->get_raid_hba_virtual_drives()), ' ';
 
 Gets the hba virtual drives for the CIMC.
 
 =cut
 
-sub get_hba_virtual_drives($;$$) {
+sub get_raid_hba_virtual_drives($;$$) {
 	my $self = shift;
 	my ($inHierarchical, $hba_dn) = @_;
+
+	carp("Getting RAID HBA virtual drives on $self->{host_addr}.") if ($self->{debug});
 
 	my $class = 'storageVirtualDrive';
 
@@ -980,19 +1376,19 @@ sub get_hba_virtual_drives($;$$) {
 
 =pod
 
-=head2 remove_hba_virtual_drive($dn)
+=head2 remove_raid_hba_virtual_drive($dn)
 
-	$cimc->remove_hba_virtual_drive($vd_resp->{dn}) or die($@);
+	$cimc->remove_raid_hba_virtual_drive($vd_resp->{dn}) or die($@);
 
 Removes the hba virtual drive at the given C<$dn> for the CIMC.
 
 =cut
 
-sub remove_hba_virtual_drive($$) {
+sub remove_raid_hba_virtual_drive($$) {
 	my $self = shift;
 	my ($vd_dn) = @_;
 
-	carp("Removing virtual drive $vd_dn from HBA on $self->{host}.") if ($self->{debug});
+	carp("Removing virtual drive $vd_dn from RAID HBA on $self->{host_addr}.") if ($self->{debug});
 
 	my $inConfig = {
 		storageVirtualDrive	=> [
@@ -1010,23 +1406,23 @@ sub remove_hba_virtual_drive($$) {
 
 =pod
 
-=head2 remove_hba_virtual_drives()
+=head2 remove_raid_hba_virtual_drives()
 
-	$cimc->remove_hba_virtual_drives() or die($@);
+	$cimc->remove_raid_hba_virtual_drives() or die($@);
 
 Removes the hba virtual drives from the CIMC.
 
 =cut
 
-sub remove_hba_virtual_drives($) {
+sub remove_raid_hba_virtual_drives($) {
 	my $self = shift;
 
-	carp("Removing virtual drives from HBA on $self->{host}.") if ($self->{debug});
+	carp("Removing virtual drives from HBA on $self->{host_addr}.") if ($self->{debug});
 
-	my $response = $self->get_hba_virtual_drives();
+	my $response = $self->get_raid_hba_virtual_drives();
 
 	foreach my $vd_resp (@$response) {
-		$self->remove_hba_virtual_drive($vd_resp->{dn}) or die($@);
+		$self->remove_raid_hba_virtual_drive($vd_resp->{dn}) or die($@);
 	}
 
 	return 1;
@@ -1035,17 +1431,19 @@ sub remove_hba_virtual_drives($) {
 
 =pod
 
-=head2 get_hba_physical_drives()
+=head2 get_raid_hba_physical_drives()
 
-	warn Dumper($cimc->get_hba_physical_drives()), ' ';
+	warn Dumper($cimc->get_raid_hba_physical_drives()), ' ';
 
 Gets the HBA physical drives for the CIMC.
 
 =cut
 
-sub get_hba_physical_drives($;$$) {
+sub get_raid_hba_physical_drives($;$$) {
 	my $self = shift;
 	my ($inHierarchical, $hba_dn) = @_;
+
+	carp("Getting RAID HBA physical drives on $self->{host_addr}.") if ($self->{debug});
 
 	my $class = 'storageLocalDisk';
 
@@ -1062,19 +1460,19 @@ sub get_hba_physical_drives($;$$) {
 
 =pod
 
-=head2 set_hba_physical_drive_jbod_mode($dn)
+=head2 set_raid_hba_physical_drive_jbod_mode($dn)
 
-	$cimc->set_hba_physical_drive_jbod_mode($pd_resp->{dn}) or die($@);
+	$cimc->set_raid_hba_physical_drive_jbod_mode($pd_resp->{dn}) or die($@);
 
 Sets the physical drive given by C<$dn> on the HBA to JBOD mode for the CIMC.
 
 =cut
 
-sub set_hba_physical_drive_jbod_mode($$) {
+sub set_raid_hba_physical_drive_jbod_mode($$) {
 	my $self = shift;
 	my ($pd_dn) = @_;
 
-	carp("Setting HBA physical drive $pd_dn on $self->{host} to JBOD mode.") if ($self->{debug});
+	carp("Setting HBA physical drive $pd_dn on $self->{host_addr} to JBOD mode.") if ($self->{debug});
 
 	my $inConfig = {
 		storageLocalDisk	=> [
@@ -1092,24 +1490,24 @@ sub set_hba_physical_drive_jbod_mode($$) {
 
 =pod
 
-=head2 set_hba_physical_drives_jbod_mode()
+=head2 set_raid_hba_physical_drives_jbod_mode()
 
-	$cimc->set_hba_physical_drives_jbod_mode() or die($@);
+	$cimc->set_raid_hba_physical_drives_jbod_mode() or die($@);
 
 Sets the physical drives on the HBA to JBOD mode for the CIMC.
 
 =cut
 
-sub set_hba_physical_drives_jbod_mode($) {
+sub set_raid_hba_physical_drives_jbod_mode($) {
 	my $self = shift;
 
-	carp("Setting HBA physical drives on $self->{host} to JBOD mode.") if ($self->{debug});
+	carp("Setting HBA physical drives on $self->{host_addr} to JBOD mode.") if ($self->{debug});
 
-	my $response = $self->get_hba_physical_drives();
+	my $response = $self->get_raid_hba_physical_drives();
 
 	foreach my $pd_resp (@$response) {
 		if ($pd_resp->{pdStatus} ne 'JBOD') {
-			$self->set_hba_physical_drive_jbod_mode($pd_resp->{dn}) or die($@);
+			$self->set_raid_hba_physical_drive_jbod_mode($pd_resp->{dn}) or die($@);
 		}
 	}
 
@@ -1129,6 +1527,8 @@ Returns the hostname for the CIMC.
 
 sub get_hostname($) {
 	my $self = shift;
+
+	carp("Getting CIMC hostname on $self->{host_addr}.") if ($self->{debug});
 
 	my $dn = 'sys/rack-unit-1/mgmt/if-1';
 
@@ -1151,7 +1551,7 @@ sub set_hostname($$) {
 	my $self = shift;
 	my ($hostname) = @_;
 
-	carp("Checking hostname on $self->{host}.") if ($self->{debug});
+	carp("Checking hostname on $self->{host_addr}.") if ($self->{debug});
 
 	# NOTE: This will cause the network to reset, so make sure to check and
 	# see if it actually needs to change first.
@@ -1161,7 +1561,7 @@ sub set_hostname($$) {
 	my $response = $self->getConfigDn($dn) or die($@);
 
 	if ($response->{mgmtIf}->[0]->{hostname} ne $hostname) {
-		carp("Setting hostname to $hostname on $self->{host}.") if ($self->{debug});
+		carp("Setting hostname to $hostname on $self->{host_addr}.") if ($self->{debug});
 
 		my $inConfig = {
 			mgmtIf	=> [
@@ -1175,7 +1575,7 @@ sub set_hostname($$) {
 
 		# Wait a moment for the host to return.
 		$self->wait_response(20, sub {
-			carp("Waiting for $self->{host} to return ...") if ($self->{debug});
+			carp("Waiting for $self->{host_addr} to return ...") if ($self->{debug});
 			$dn = 'sys';
 			$response = $self->getConfigDn($dn);
 			if ($response && $response->{topSystem}) {
@@ -1206,6 +1606,8 @@ Returns the timezone for the CIMC.
 sub get_timezone($) {
 	my $self = shift;
 
+	carp("Getting CIMC timezone on $self->{host_addr}.") if ($self->{debug});
+
 	my $dn = 'sys';
 
 	my $response = $self->getConfigDn($dn) or die($@);
@@ -1229,7 +1631,7 @@ sub set_timezone($$) {
 	my ($timezone) = @_;
 	#$timezone = 'America/Chicago' unless ($timezone);
 
-	carp("Setting timezone to $timezone on $self->{host}.") if ($self->{debug});
+	carp("Setting timezone to $timezone on $self->{host_addr}.") if ($self->{debug});
 
 	my $dn = 'sys';
 	my $inConfig = {
@@ -1259,6 +1661,8 @@ Returns the state of the indicator light for the CIMC.
 sub get_indicator_led($) {
 	my $self = shift;
 
+	carp("Getting indicator LED status on $self->{host_addr}.") if ($self->{debug});
+
 	my $dn = 'sys/rack-unit-1/locator-led';
 	my $response = $self->getConfigDn($dn) or die($@);
 
@@ -1282,7 +1686,7 @@ sub set_indicator_led($$) {
 
 	$state = (check_bool($state)) ? 'on' : 'off';
 
-	carp("Turning indicator led $state for $self->{host}.") if ($self->{debug});
+	carp("Turning indicator led $state for $self->{host_addr}.") if ($self->{debug});
 
 	my $dn = 'sys/rack-unit-1/locator-led';
 	my $inConfig = {
@@ -1295,8 +1699,61 @@ sub set_indicator_led($$) {
 	};
 	my $response = $self->setConfig($inConfig, $dn);
 
-	carp("Failed to turn indicator led $state for $self->{host}.  $@ ") unless ($response);
+	carp("Failed to turn indicator led $state for $self->{host_addr}.  $@ ") unless ($response);
 	
+	return $response;
+}
+
+
+=pod
+
+=head2 get_sel_debug_log_info()
+
+	warn Dumper($cimc->get_sel_debug_log_info());
+
+Returns the state of the sys/sel debug log.
+
+=cut
+
+sub get_sel_debug_log_info($) {
+	my $self = shift;
+
+	carp("Getting CIMC SEL log info on $self->{host_addr}.") if ($self->{debug});
+
+	my $dn = 'sys/rack-unit-1/mgmt/log-SEL-0';
+	my $response = $self->getConfigDn($dn, 1) or die($@);
+
+	return $response->{sysdebugMEpLog}->[0];
+}
+
+
+=pod
+
+=head2 clear_sel_debug_log()
+
+	warn Dumper($cimc->clear_sel_debug_log());
+
+Clears the SEL debug log.
+
+=cut
+
+sub clear_sel_debug_log($) {
+	my $self = shift;
+
+	carp("Clearing CIMC SEL log on $self->{host_addr}.") if ($self->{debug});
+
+	my $dn = 'sys/rack-unit-1/mgmt/log-SEL-0';
+	my $inConfig = {
+		sysdebugMEpLog	=> [
+			{
+				dn		=> $dn,
+				type		=> 'SEL',
+				adminState	=> 'clear',
+			},
+		],
+	};
+	my $response = $self->setConfig($inConfig, $dn) or die($@);
+
 	return $response;
 }
 
@@ -1313,6 +1770,8 @@ Gets the current power state of the server.
 
 sub get_power_mode($) {
 	my $self = shift;
+
+	carp("Getting node power mode on $self->{host_addr}.") if ($self->{debug});
 
 	my $dn = 'sys/rack-unit-1';
 	my $response = $self->getConfigDn($dn) or die($@);
@@ -1335,32 +1794,62 @@ sub set_power_mode($$) {
 	my $self = shift;
 	my ($mode) = @_;
 
+	# Some NOTEs on the various operation modes we can try and do:
+	#
+	# bmc-reset-immediate: 
+	# 	Reboot the CIMC.
+	# bmc-reset-default: 
+	# 	Resets the CIMC to defaults, thus requires another
+	# 	couple of rounds of setup-cloudlab-cisco-cimc to get
+	# 	the vlans/addresses right again.
+	# cmos-reset-immediate: 
+	# 	Reset the CMOS settings, thus probably requires another
+	# 	setup-cloudlab-cisco-cimc.pl.
+	#	NOTE: power must be off to do this.
+
 	my $operPower = $self->get_power_mode();
 
 	my $op;
-	if ($operPower eq 'off') { 
-		if ($mode eq 'up') {
-			$op = $mode;
-		}
-		elsif ($mode =~ /^(cycle-immediate|hard-reset-immediate)$/) {
-			# They really want to just power the machine on.
-			$op = 'up';
-		}
-		# else, nothing else really makes sense, just skip it.
+
+	# For the first handful, we don't care what power state the machine is
+	# in since they only affect the CIMC, not the node itself.
+	if ($mode =~ /^(bmc-reset-immediate|bmc-reset-default)$/) {
+		# Just do it:
+		$op = $mode;
 	}
-	elsif ($operPower eq 'on') {
-		if ($mode ne 'up') {
-			# pretty much everything else makes sense
+	elsif ($mode =~ /^(up|down|soft-shut-down|cycle-immediate|hard-reset-immediate|diagnostic-interrupt|cmos-reset-immediate)$/) {
+		if ($operPower eq 'off') { 
+			if ($mode eq 'up' || $mode eq 'cmos-reset-immediate') {
+				$op = $mode;
+			}
+			elsif ($mode =~ /^(cycle-immediate|hard-reset-immediate)$/) {
+				# They really want to just power the machine on.
+				$op = 'up';
+			}
+			# else, nothing else really makes sense, just skip it.
+		}
+		elsif ($operPower eq 'on') {
+			if ($mode eq 'cmos-reset-immediate') {
+				carp("Must be powered off to perform a cmos-reset-immediate operation.");
+			}
+			elsif ($mode ne 'up') {
+				# pretty much everything else makes sense
+				$op = $mode;
+			}
+			# else, just skip it
+		}
+		else {
+			carp("Unhandled operPower state: '$operPower'.  Will attempt to set adminPower to '$mode' anyways, but it may fail.");
 			$op = $mode;
 		}
-		# else, just skip it
 	}
 	else {
-		carp("Unhandled operPower state: $operPower.  Will attempt to set adminPower to '$mode' anyways, but it may fail.");
-		$op = $mode;
+		croak("Unhandled adminPower operation mode: '$mode'.");
 	}
 
 	if ($op) {
+		carp("Setting node adminPower state to $op on $self->{host_addr}.") if ($self->{debug} > 1);
+
 		my $dn = 'sys/rack-unit-1';
 		my $inConfig = {
 			computeRackUnit	=> [
@@ -1392,9 +1881,171 @@ Reboots the server.
 sub reboot_machine($) {
 	my $self = shift;
 
-	carp("Power cycling $self->{host}.") if ($self->{debug});
+	carp("Power cycling $self->{host_addr}.") if ($self->{debug});
 
 	return $self->set_power_mode('cycle-immediate');
+}
+
+
+=pod
+
+=head2 reboot_cimc()
+
+	$cimc->reboot_cimc();
+
+Reboots the CIMC on the server.
+
+=cut
+
+sub reboot_cimc($) {
+	my $self = shift;
+
+	carp("Rebooting CIMC on $self->{host_addr}.") if ($self->{debug});
+
+	return $self->set_power_mode('bmc-reset-immediate');
+}
+
+
+=pod
+
+=head2 reset_cmos()
+
+	$cimc->reset_cmos();
+
+Resets the CMOS on the CIMC/server.
+
+NOTE: May require BIOS settings reconfig after this operation.
+NOTE: This will power the machine off first.
+
+=cut
+
+sub reset_cmos($) {
+	my $self = shift;
+
+	carp("Resetting CMOS on $self->{host_addr}.") if ($self->{debug});
+
+	# We have to be powered off for the following command to work.
+	$self->set_power_mode('down');
+
+	return $self->set_power_mode('cmos-reset-immediate');
+}
+
+
+=pod
+
+=head2 send_nmi()
+
+	$cimc->send_nmi();
+
+Sends the host an NMI (diagnostic interrupt).
+
+=cut
+
+sub send_nmi($) {
+	my $self = shift;
+
+	carp("Sending $self->{host_addr} an NMI.") if ($self->{debug});
+
+	return $self->set_power_mode('diagnostic-interrupt');
+}
+
+
+=pod
+
+=head2 get_power_budget()
+
+	warn Dumper($cimc->get_power_budget());
+
+=cut
+
+sub get_power_budget($) {
+	my $self = shift;
+
+	carp("Getting node power budget info on $self->{host_addr}.") if ($self->{debug});
+
+	my $class = 'powerBudget';
+
+	my $response = $self->getConfigClass($class, 1) or die($@);
+
+	return $response;
+}
+
+
+=pod
+
+=head2 set_power_characterization($$)
+
+	$cimc->set_power_characterization('off');
+
+Sets the power characterization to C<on> (run at boot), C<off> (disabled), or
+C<now> (run once now).
+
+NOTE: Running the power characterization routine now will reboot the machine.
+
+=cut
+
+sub set_power_characterization($$) {
+	my $self = shift;
+	my ($mode) = @_;
+
+	carp("Setting power characterization mode to $mode on $self->{host_addr}.") if ($self->{debug});
+
+	my %opts;
+	if ($mode eq 'now') {
+		%opts = (
+			adminAction	=> 'start-power-char',
+		);
+	}
+	elsif (check_bool($mode)) {
+		%opts = (
+			runPowCharAtBoot	=> 'yes',
+		);
+	}
+	elsif (!check_bool($mode)) {
+		%opts = (
+			runPowCharAtBoot	=> 'no',
+		);
+	}
+
+	my $dn = 'sys/rack-unit-1/budget';
+	my $inConfig = {
+		powerBudget	=> [
+			{
+				%opts,
+				dn	=> $dn,
+			},
+		],
+	};
+	my $response = $self->setConfig($inConfig, $dn) or die($@);
+
+	return $response;
+}
+
+
+=pod
+
+=head2 get_computed_bios_boot_order()
+
+	warn Dumper($cimc->get_computed_bios_boot_order());
+
+Returns the currently computed BIOS boot order.
+
+NOTE: That's generally only computed at boot, so this may need to be rechecked
+after a reboot following any updates to the lsboot* nodes that control the
+general boot ordering preferences.
+
+=cut
+
+sub get_computed_bios_boot_order($) {
+	my $self = shift;
+
+	carp("Getting CIMC computed BIOS boot order on $self->{host_addr}.") if ($self->{debug});
+
+	my $class = 'biosBootDevPrecision';
+
+	my $response = $self->getConfigClass($class, 1) or die($@);
+
+	return $response;
 }
 
 
@@ -1444,6 +2095,8 @@ Returns the status of any currently executing firmware updates.
 sub get_firmware_update_status($) {
 	my $self = shift;
 
+	carp("Getting CIMC firmware update status on $self->{host_addr}.") if ($self->{debug});
+
 	my $class = 'huuFirmwareUpdater';
 
 	my $response = $self->getConfigClass($class, 1) or die($@);
@@ -1492,7 +2145,7 @@ sub wait_for_firmware_update_completion($) {
 	my $self = shift;
 
 	$self->wait_response(2700, sub {
-		carp("Waiting for firmware update to complete ...") if ($self->{debug});
+		carp("Waiting for firmware update to complete on $self->{host_addr} ...") if ($self->{debug});
 
 		return $self->check_firmware_update_status();
 	}) or croak($@);
@@ -1520,7 +2173,7 @@ sub update_firmware($$) {
 	my $self = shift;
 	my ($opts) = @_;
 
-	carp("Updating firmware on $self->{host}.") if ($self->{debug});
+	carp("Updating firmware on $self->{host_addr}.") if ($self->{debug});
 
 	my $dn = 'sys/huu/firmwareUpdater';
 	my $inConfig = {
@@ -1531,7 +2184,7 @@ sub update_firmware($$) {
 				verifyUpdate	=> 'yes',
 				stopOnError	=> 'yes',
 				updateComponent	=> 'all',
-				timeOut		=> 120,
+				timeOut		=> TIMEOUT,
 				%$opts,
 			},
 		],
@@ -1544,6 +2197,126 @@ sub update_firmware($$) {
 	return $response;
 }
 
+
+=pod
+
+=head2 get_firmware_version(;$)
+
+	warn Dumper($cimc->get_firmware_version($force = 1));
+
+Retreives and caches the current firmware version of the CIMC.
+
+=cut
+
+sub get_firmware_version($;$) {
+	my $self = shift;
+	my ($force) = @_;
+
+	if ($force || !$self->{firmware_version}) {
+		carp("Getting CIMC firmware version on $self->{host_addr}.") if ($self->{debug});
+
+		my $dn = 'sys/rack-unit-1/mgmt/fw-system';
+		my $response = $self->getConfigDn($dn) or croak($@);
+		$self->{firmware_version} = $response->{firmwareRunning}->[0]->{version};
+	}
+
+	return $self->{firmware_version};
+}
+
+
+=pod
+
+=head2 compare_firmware_version($$)
+
+	$cimc->compare_firmware_version('>=', '2.0(8d)')
+		and warn("CIMC firmware version >= 2.0(8d)");
+
+
+Performs a version comparison of the current CIMC and the provided value and
+comparison function.
+
+=cut
+
+sub compare_firmware_version($$$) {
+	my $self = shift;
+	my ($op, $to) = @_;
+
+	my $current_firmware_version = $self->get_firmware_version();
+
+	return _compare_firmware_versions($self->{firmware_version}, $op, $to);
+}
+
+sub _compare_firmware_versions($$$) {
+	my ($ver, $op, $to) = @_;
+	# Copied from MySQL version comparison code written ages ago.
+	# Accept that it didn't handle alphas in the string ...
+	# Hurray, a module that seems to do the trick (Sort::Versions).
+
+	if (!defined($ver)) {
+		if ($op eq '<=' || $op eq 'le' || $op eq 'lte') {
+			$ver = 0+'inf';
+		}
+		elsif ($op eq '<' || $op eq 'lt') {
+			$ver = 0+'inf';
+		}
+		elsif ($op eq '>=' || $op eq 'ge' || $op eq 'gte') {
+			$ver = 0;
+		}
+		elsif ($op eq '>' || $op eq 'gt') {
+			$ver = 0;
+		}
+		elsif ($op eq '==' || $op eq 'eq') {
+			$ver = 0;
+		}
+		else {  
+			croak("ERROR: Invalid comparison operator: '$op'");
+		}
+	}
+
+	if (!defined($to)) {
+		if ($op eq '<=' || $op eq 'le' || $op eq 'lte') {
+			$to = 0+'inf';
+		}
+		elsif ($op eq '<' || $op eq 'lt') {
+			$to = 0+'inf';
+		}
+		elsif ($op eq '>=' || $op eq 'ge' || $op eq 'gte') {
+			$to = 0;
+		}
+		elsif ($op eq '>' || $op eq 'gt') {
+			$to = 0;
+		}
+		elsif ($op eq '==' || $op eq 'eq') {
+			$to = 0;
+		}
+		else { 
+			croak("ERROR: Invalid comparison operator: '$op'");
+		}
+	}
+
+	my $cmp = versioncmp($ver, $to);
+
+	if ($op eq '<=' || $op eq 'le' || $op eq 'lte') {
+		return 1 if ($cmp <= 0);
+	}
+	elsif ($op eq '<' || $op eq 'lt') {
+		return 1 if ($cmp < 0);
+	}
+	elsif ($op eq '>=' || $op eq 'ge' || $op eq 'gte') {
+		return 1 if ($cmp >= 0);
+	}
+	elsif ($op eq '>' || $op eq 'gt') {
+		return 1 if ($cmp > 0);
+	}
+	elsif ($op eq '==' || $op eq 'eq') {
+		return 1 if ($cmp == 0);
+	}
+	else {  
+		croak("ERROR: Invalid comparison operator: '$op'");
+	}
+
+	return 0;
+}
 
 
 =pod
@@ -1558,7 +2331,7 @@ sub update_firmware($$) {
 
 	$self->_init_lwp_ua();
 
-Internal function for initializing an L<LWP::UserAgent> to C<${host}:443>.
+Internal function for initializing an L<LWP::UserAgent> to C<${addr}:443>.
 
 Optionally accepts a boolean value for whether or not to force a reinitialization.
 
@@ -1579,8 +2352,9 @@ sub _init_lwp_ua($;$) {
 			# Try to keep the connection open while we make
 			# individual requests, mostly just to avoid lots of SSL
 			# session start overhead.
+			# NOTE: That doesn't actually seem to work unfortunately.
 			keep_alive	=> 1,
-			timeout		=> 120,
+			timeout		=> TIMEOUT,
 		);
 	}
 	return $self->{lwp_ua};
@@ -1614,6 +2388,9 @@ sub _issue_request($$) {
 	my $self = shift;
 	my ($request) = @_;
 	my $response;
+
+	my $isRetry = 0;
+	RETRY:
 
 	# See NOTEs below about XML validation.
 	# For now, the poor man's validation is the following assumption/check:
@@ -1653,7 +2430,25 @@ sub _issue_request($$) {
 			or croak('ERROR: Failed to _init_lwp_ua()!');
 	}
 
-	my $url = sprintf('https://%s/nuova', $self->{host});
+	if (!$self->ping()) {
+		if (!$isRetry) {
+			# Try to re-obtain an auth cookie for requests
+			# that may have just taken longer than expected.
+			carp("Failed to ping '$self->{host_addr}'.  Attempting to refresh session and retry.") if ($self->{debug});
+			$isRetry = 1;
+			delete($request->{$top_level_key}->[0]->{cookie});
+			sleep(1);
+			$self->_init_lwp_ua(1);
+			$self->_clear_local_auth_cookie();
+			goto RETRY;
+		}
+		else {
+			$@ = "Failed to ping '$self->{host_addr}'.";
+			return undef;
+		}
+	}
+
+	my $url = sprintf('https://%s/nuova', $self->{addr});
 	my $xml_request = $self->{xs}->XMLout($request);
 
 	#warn('$url:', Dumper($url), ' ') if ($self->{debug} > 2);
@@ -1687,35 +2482,78 @@ sub _issue_request($$) {
 		# See NOTEs above about top level response checking assumptions.
 		@keys = keys(%{$response});
 		if (scalar(@keys) != 1 || !$SUPPORTED_XML{$keys[0]}) {
-			$@ = 'Invalid response: '.Dumper($response).' ';
+			$@ = "Invalid response from '$self->{host_addr}': ".Dumper($response).' ';
 			$response = undef;
 		}
 		elsif ( $keys[0] eq 'error' 
 			&& $response->{'error'}->[0] 
 			&& $response->{'error'}->[0]->{response} eq 'yes'
 		) {
-			$@ = $response->{'error'}->[0]->{errorDescr};
+			$@ = "'".$response->{'error'}->[0]->{errorDescr}."' from '$self->{host_addr}'.";
 			$response = undef;
 		}
 		elsif ($keys[0] ne $top_level_key) {
-			$@ = 'Unexpected response: '.Dumper($response).' ';
+			$@ = "Unexpected response from '$self->{host_addr}': ".Dumper($response).' ';
 			$response = undef;
 		}
 		else {
+			if ($response->{$top_level_key}->[0]
+				&& !$isRetry
+				&& $top_level_key !~ /^aaa/
+				&& $response->{$top_level_key}->[0]->{response} eq 'yes'
+				&& $response->{$top_level_key}->[0]->{errorCode}
+				&& $response->{$top_level_key}->[0]->{errorCode} eq '552'
+				&& $response->{$top_level_key}->[0]->{errorDescr}
+				&& $response->{$top_level_key}->[0]->{errorDescr} eq 'Authorization required'
+			) {
+				# Try to re-obtain an auth cookie for requests
+				# that may have just taken longer than expected.
+				carp("Session error encountered while talking to '$self->{host_addr}'.  Attempting to refresh session and retry.") if ($self->{debug});
+				$isRetry = 1;
+				delete($request->{$top_level_key}->[0]->{cookie});
+				sleep(1);
+				$self->_init_lwp_ua(1);
+				$self->_clear_auth_cookie();
+				goto RETRY;
+			}
+
 			if ($response->{$top_level_key}->[0]
 				&& $response->{$top_level_key}->[0]->{response} eq 'yes' 
 				&& !$response->{$top_level_key}->[0]->{errorCode}
 			) {
 				# Assume success and let the caller parse the rest of the results.
+
+				# To try and print warnings and status messages though.
+				if ($self->{debug} && $response->{$top_level_key}->[0]->{outStatus}) {
+					carp($response->{$top_level_key}->[0]->{outStatus})
+						unless ($top_level_key eq 'aaaLogout');
+				}
 			}
 			else {
-				$@ = $response->{$top_level_key}->[0]->{errorDescr};
+				$@ = "'".$response->{$top_level_key}->[0]->{errorDescr}."' from '$self->{host_addr}'.";
 				$response = undef;
 			}
 		}
 	}
 	else {
-		$@ = $http_response->status_line;
+		if (!$isRetry) {
+			# Try to re-obtain an auth cookie for requests
+			# that may have just taken longer than expected.
+			carp("HTTP error encountered while talking to '$self->{host_addr}'.  Attempting to refresh session and retry.") if ($self->{debug});
+			$isRetry = 1;
+			delete($request->{$top_level_key}->[0]->{cookie});
+			sleep(1);
+			$self->_init_lwp_ua(1);
+			# In this case we can't actually use the usual subs since
+			# they also use _issue_request() which causes the
+			# $isRetry variable to constantly be reset to 0 thus
+			# causing an infinite loop.  Serves me right for using
+			# goto statements :P
+			#$self->_get_auth_cookie(1);
+			$self->_clear_local_auth_cookie();
+			goto RETRY;
+		}
+		$@ = "'".$http_response->status_line."' from '$self->{host_addr}'.";
 		$response = undef;
 	}
 
@@ -1761,8 +2599,8 @@ sub _get_auth_cookie($;$) {
 			],
 		};
 	}
-	elsif ($self->{auth_cookie} && $self->{auth_cookie_valid_until} < $now + 30) {
-		# Refresh the cookie before it expires.
+	elsif ($self->{auth_cookie} && $self->{auth_cookie_valid_until} < $now + TIMEOUT) {
+		# Refresh the cookie before it expires or we timeout.
 		$request = {
 			aaaRefresh	=> [
 				{
@@ -1781,9 +2619,20 @@ sub _get_auth_cookie($;$) {
 			if ($response->{aaaLogin}->[0]->{outCookie});
 		$self->{auth_cookie_valid_until} = $now + $response->{aaaLogin}->[0]->{outRefreshPeriod} 
 			if ($response->{aaaLogin}->[0]->{outRefreshPeriod});
+
+		## Clear firmware_version cache.
+		#$self->{firmware_version} = undef;
 	}
 
 	return $self->{auth_cookie};
+}
+
+
+sub _clear_local_auth_cookie($) {
+	my $self = shift;
+	
+	$self->{auth_cookie} = undef;
+	$self->{auth_cookie_valid_until} = 0;
 }
 
 
@@ -1797,7 +2646,7 @@ Internal function for clearing an authentication session from the CICM.
 
 =cut
 
-sub _clear_auth_cookie() {
+sub _clear_auth_cookie($;$) {
 	my $self = shift;
 	#my ($force) = @_;
 
@@ -1819,8 +2668,7 @@ sub _clear_auth_cookie() {
 		}
 	}
 
-	$self->{auth_cookie} = undef;
-	$self->{auth_cookie_valid_until} = 0;
+	$self->_clear_local_auth_cookie();
 }
 
 
@@ -1848,6 +2696,29 @@ sub check_bool($) {
 	}
 	else {
 		return undef;
+	}
+}
+
+
+=pod
+
+=head2 get_host_addr_string($$)
+
+Returns a user friendly version of $host and/or $addr for printing.
+
+=cut
+
+sub get_host_addr_string($$) {
+	my ($host, $addr) = @_;
+	my ($name, $domain) = split(/[.]/, $addr, 2);
+	if ($name eq $host) {
+		return $host;	# short names match, just use that
+	}
+	elsif ($host eq $addr) {
+		return $addr;	# they're the same, just use that
+	}
+	else {	# else, show both
+		return $host.'['.$addr.']';
 	}
 }
 
