@@ -613,6 +613,32 @@ sub get_rack_unit_info($;$) {
 
 =pod
 
+=head2 get_machine_faults()
+
+	my (@faults) = $cimc->get_machine_faults();
+
+Ask the CIMC what faults it thinks the machine currently has.
+
+NOTE: This unfortunately can't provide information about failed disks in
+machines with passthru HBAs - there's no smarts there to check the SMART status
+:P
+
+=cut
+
+sub get_machine_faults($) {
+	my $self = shift;
+
+	carp("Getting machine faults on $self->{host_addr}.") if ($self->{debug});
+
+	my $response = $self->getConfigClass('faultInst');
+	return () unless ($response && $response->{faultInst});
+
+	return @{$response->{faultInst}};
+}
+
+
+=pod
+
 =head2 get_product_inventory()
 
 	warn Dumper($cimc->get_product_inventory()), ' ';
@@ -654,7 +680,7 @@ sub load_product_inventory($) {
 	$self->wait_response(180, sub {
 		carp("Waiting for pidCatalog to load ...") if ($self->{debug});
 		my $response = $self->get_product_inventory(1);
-		if (scalar(grep { $_ =~ /^pidCatalog/ } keys($response->{pidCatalog}->[0]))) {
+		if (scalar(grep { $_ =~ /^pidCatalog/ } keys(%{$response->{pidCatalog}->[0]}))) {
 			return 1;
 		}
 		else {
@@ -2317,6 +2343,7 @@ sub _compare_firmware_versions($$$) {
 
 	return 0;
 }
+
 
 
 =pod
